@@ -1,0 +1,157 @@
+/*
+ Licensed to the Apache Software Foundation (ASF) under one
+ or more contributor license agreements.  See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership.  The ASF licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+ */
+package org.apache.plc4x.nifi;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import org.apache.nifi.annotation.behavior.InputRequirement;
+import org.apache.nifi.annotation.behavior.WritesAttribute;
+import org.apache.nifi.annotation.behavior.WritesAttributes;
+import org.apache.nifi.annotation.documentation.CapabilityDescription;
+import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.annotation.lifecycle.OnScheduled;
+import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.logging.ComponentLog;
+import org.apache.nifi.processor.ProcessContext;
+import org.apache.nifi.processor.ProcessSession;
+import org.apache.nifi.processor.ProcessorInitializationContext;
+import org.apache.nifi.processor.Relationship;
+import org.apache.nifi.processor.exception.ProcessException;
+import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.nifi.serialization.RecordSetWriterFactory;
+import org.apache.plc4x.java.api.PlcConnection;
+import org.apache.plc4x.java.api.exceptions.PlcConnectionException;
+import org.apache.plc4x.java.api.exceptions.PlcRuntimeException;
+import org.apache.plc4x.java.api.messages.PlcReadRequest;
+
+@Tags({ "plc4x-source" })
+@InputRequirement(InputRequirement.Requirement.INPUT_ALLOWED)
+@CapabilityDescription("Processor able to read data from industrial PLCs using Apache PLC4X")
+@WritesAttributes({ @WritesAttribute(attribute = "value", description = "some value") })
+public class Plc4xSourceRecordProcessor extends BasePlc4xProcessor {
+
+	public static final String RESULT_ROW_COUNT = "plc4x.read.row.count";
+	public static final String RESULT_QUERY_DURATION = "plc4x.read.query.duration";
+	public static final String RESULT_QUERY_EXECUTION_TIME = "plc4x.read.query.executiontime";
+	public static final String RESULT_QUERY_FETCH_TIME = "plc4x.read.query.fetchtime";
+	public static final String INPUT_FLOWFILE_UUID = "input.flowfile.uuid";
+	public static final String RESULT_ERROR_MESSAGE = "plc4x.read.error.message";
+
+	public static final PropertyDescriptor PLC_RECORD_WRITER_FACTORY = new PropertyDescriptor.Builder().name("plc4x-record-writer").displayName("Record Writer")
+		.description("Specifies the Controller Service to use for writing results to a FlowFile. The Record Writer may use Inherit Schema to emulate the inferred schema behavior, i.e. "
+				+ "an explicit schema need not be defined in the writer, and will be supplied by the same logic used to infer the schema from the column types.")
+		.identifiesControllerService(RecordSetWriterFactory.class)
+		.required(true)
+		.build();
+	
+	public static final PropertyDescriptor PLC_READ_FUTURE_TIMEOUT_MILISECONDS = new PropertyDescriptor.Builder().name("plc4x-record-read-timeout").displayName("Read timeout (miliseconds)")
+		.description("Read timeout in miliseconds")
+		.defaultValue("10000")
+		.required(true)
+		.addValidator(StandardValidators.INTEGER_VALIDATOR)
+		.build();
+
+	Integer readTimeout;
+	public Plc4xSourceRecordProcessor() {
+   // document why this constructor is empty
+ }
+
+	@Override
+	protected void init(final ProcessorInitializationContext context) {
+		super.init(context);
+		final Set<Relationship> r = new HashSet<>();
+		r.addAll(super.getRelationships());
+		this.relationships = Collections.unmodifiableSet(r);
+
+		final List<PropertyDescriptor> pds = new ArrayList<>();
+		pds.addAll(super.getSupportedPropertyDescriptors());
+		pds.add(PLC_RECORD_WRITER_FACTORY);
+		pds.add(PLC_READ_FUTURE_TIMEOUT_MILISECONDS);
+		this.properties = Collections.unmodifiableList(pds);
+	}
+
+	@OnScheduled
+	@Override
+	public void onScheduled(final ProcessContext context) {
+        super.connectionString = context.getProperty(PLC_CONNECTION_STRING.getName()).getValue();
+        this.readTimeout = context.getProperty(PLC_READ_FUTURE_TIMEOUT_MILISECONDS.getName()).asInteger();
+		addressMap = new HashMap<>();
+		//variables are passed as dynamic properties
+		context.getProperties().keySet().stream().filter(PropertyDescriptor::isDynamic).forEach(
+				t -> addressMap.put(t.getName(), context.getProperty(t.getName()).getValue()));
+		if (addressMap.isEmpty()) {
+			throw new PlcRuntimeException("No address specified");
+		}	
+	}
+	
+	@Override
+	public void onTrigger(final ProcessContext context, final ProcessSession session) throws ProcessException {
+		FlowFile fileToProcess = null;
+		//In the future the processor will be configurable to get the address and the connection from incoming flowfile
+		if (context.hasIncomingConnection()) {
+			fileToProcess = session.get();
+			// If we have no FlowFile, and all incoming connections are self-loops then we
+			// can continue on.
+			// However, if we have no FlowFile and we have connections coming from other
+			// Processors, then we know that we should run only if we have a FlowFile.
+			if (fileToProcess == null && context.hasNonLoopConnection()) {
+				return;
+			}
+		}
+		
+		final ComponentLog logger = getLogger();
+
+		try (PlcConnection connection = getDriverManager().getConnection(getConnectionString())) {
+
+			Map<String, String> inputFileAttrMap = fileToProcess == null ? null : fileToProcess.getAttributes();
+			FlowFile resultSetFF;
+			if (fileToProcess == null) {
+				resultSetFF = session.create();
+			} else {
+				resultSetFF = session.create(fileToProcess);
+			}
+			if (inputFileAttrMap != null) {
+				resultSetFF = session.putAllAttributes(resultSetFF, inputFileAttrMap);
+			}
+
+			PlcReadRequest.Builder builder = connection.readRequestBuilder();
+			getTags().forEach(tagName -> {
+				String address = getAddress(tagName);
+				if (address != null) {
+					builder.addTagAddress(tagName, address);
+				}
+			});
+			
+		} catch (PlcConnectionException e) {
+			logger.error("Error getting the PLC connection", e);
+			throw new ProcessException("Got an a PlcConnectionException while trying to get a connection", e);
+		} catch (Exception e) {
+			logger.error("Got an error while trying to get a connection", e);
+			throw new ProcessException("Got an error while trying to get a connection", e);
+		}
+	}
+
+}
